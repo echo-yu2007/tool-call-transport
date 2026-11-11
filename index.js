@@ -9,6 +9,8 @@
   const OUTPUT_PARAM = 'content';
   const CONTEXT_TOOL = 'read_context';
   const INPUT_TOOL = 'read_current_input';
+  const LOG_KEY = 'tool-call-transport.logs.v1';
+  const LOG_LIMIT = 50;
 
   const defaults = {
     enabled: true,
@@ -19,7 +21,14 @@
   };
 
   const settings = loadSettings();
-  const runtime = { target: null, originalFetch: null, installed: false, lastStatus: '等待请求' };
+  const runtime = {
+    target: null,
+    originalFetch: null,
+    installed: false,
+    lastStatus: '等待请求',
+    logs: loadLogs(),
+    requestSequence: 0,
+  };
 
   function loadSettings() {
     try {
@@ -33,10 +42,71 @@
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   }
 
+  function loadLogs() {
+    try {
+      const parsed = JSON.parse(sessionStorage.getItem(LOG_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed.slice(-LOG_LIMIT) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveLogs() {
+    try {
+      sessionStorage.setItem(LOG_KEY, JSON.stringify(runtime.logs));
+    } catch {
+      // Logging must never block generation.
+    }
+  }
+
+  function renderLogs() {
+    const node = document.querySelector('#tct-settings .tct-log');
+    if (!node) return;
+    node.textContent = runtime.logs.length
+      ? runtime.logs.map(entry => JSON.stringify(entry)).join('\n')
+      : '暂无日志';
+    node.scrollTop = node.scrollHeight;
+  }
+
+  function addLog(level, event, details = {}) {
+    const entry = {
+      time: new Date().toISOString(),
+      level,
+      event,
+      ...details,
+    };
+    runtime.logs.push(entry);
+    if (runtime.logs.length > LOG_LIMIT) runtime.logs.splice(0, runtime.logs.length - LOG_LIMIT);
+    saveLogs();
+    renderLogs();
+    const method = level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info';
+    console[method](TAG, event, details);
+    return entry;
+  }
+
   function setStatus(text) {
     runtime.lastStatus = text;
     const node = document.querySelector('#tct-settings .tct-status');
     if (node) node.textContent = text;
+  }
+
+  function errorDetails(error) {
+    return {
+      name: String(error?.name || 'Error'),
+      message: String(error?.message || error || 'Unknown error'),
+      stack: typeof error?.stack === 'string' ? error.stack.slice(0, 1600) : '',
+    };
+  }
+
+  function sourceSummary(body) {
+    return {
+      source: String(body?.chat_completion_source || ''),
+      channel: strategy(body?.chat_completion_source),
+      model: String(body?.model || ''),
+      messageCount: Array.isArray(body?.messages) ? body.messages.length : 0,
+      toolCount: Array.isArray(body?.tools) ? body.tools.length : 0,
+      stream: body?.stream,
+    };
   }
 
   function textOf(content) {
@@ -166,7 +236,7 @@
     setOutputTool(body);
 
     if (strategy(body.chat_completion_source) === 'native' || !settings.contextInTools) {
-      return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM };
+      return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM, wrappedInput: false };
     }
 
     const sourceMessages = body.messages.slice();
@@ -226,11 +296,11 @@
 
     if (currentInput) body.messages.push(...fabricatedInputPair(currentInput, body.model));
     body.stream = false;
-    return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM };
+    return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM, wrappedInput: Boolean(currentInput) };
   }
 
   function calledName(call) {
-    return call?.function?.name || call?.name || '';
+    return String(call?.function?.name || call?.name || '').replace(/^default_api:/, '');
   }
 
   function parseArgument(raw, paramName) {
@@ -274,10 +344,11 @@
       if (candidate?.content) containers.push(candidate.content);
     }
     if (data?.responseContent) containers.push(data.responseContent);
+    if (Array.isArray(data?.parts)) containers.push(data);
     for (const content of containers) {
       const parts = Array.isArray(content.parts) ? content.parts : [];
       const text = parts
-        .filter(part => (part.functionCall?.name || part.function_call?.name) === toolName)
+        .filter(part => calledName(part.functionCall || part.function_call) === toolName)
         .map(part => parseArgument(part.functionCall?.args || part.function_call?.args, paramName))
         .filter(Boolean)
         .join('\n');
@@ -286,6 +357,37 @@
       changed = true;
     }
     return changed;
+  }
+
+  function responseSummary(data) {
+    const openAITools = [];
+    for (const choice of data?.choices || []) {
+      for (const call of choice?.message?.tool_calls || []) {
+        openAITools.push(String(call?.function?.name || call?.name || ''));
+      }
+    }
+    const geminiTools = [];
+    const partGroups = [];
+    for (const candidate of data?.candidates || []) {
+      if (Array.isArray(candidate?.content?.parts)) partGroups.push(candidate.content.parts);
+    }
+    if (Array.isArray(data?.responseContent?.parts)) partGroups.push(data.responseContent.parts);
+    if (Array.isArray(data?.parts)) partGroups.push(data.parts);
+    for (const parts of partGroups) {
+      for (const part of parts) {
+        const call = part?.functionCall || part?.function_call;
+        if (call) geminiTools.push(String(call.name || ''));
+      }
+    }
+    return {
+      topLevelKeys: data && typeof data === 'object' ? Object.keys(data).slice(0, 30) : [],
+      choices: Array.isArray(data?.choices) ? data.choices.length : 0,
+      candidates: Array.isArray(data?.candidates) ? data.candidates.length : 0,
+      hasResponseContent: Boolean(data?.responseContent),
+      hasTopLevelParts: Array.isArray(data?.parts),
+      openAITools,
+      geminiTools,
+    };
   }
 
   function headerPairs(headers) {
@@ -304,6 +406,18 @@
   async function restoreResponse(response, result) {
     if (!response?.ok) {
       setStatus(`上游返回 HTTP ${response?.status || '错误'}`);
+      let upstreamText = '';
+      try {
+        upstreamText = (await response.clone().text()).replace(/\s+/g, ' ').slice(0, 500);
+      } catch {
+        // Keep the original response untouched.
+      }
+      addLog('error', 'upstream_http_error', {
+        requestId: result.requestId,
+        http: response?.status || 0,
+        statusText: String(response?.statusText || ''),
+        preview: upstreamText,
+      });
       return response;
     }
     let text;
@@ -311,6 +425,7 @@
       text = await response.clone().text();
     } catch {
       setStatus('响应无法预读，已原样放行');
+      addLog('error', 'response_clone_failed', { requestId: result.requestId });
       return response;
     }
     let data;
@@ -318,15 +433,31 @@
       data = JSON.parse(text);
     } catch {
       setStatus('响应不是 JSON，已原样放行');
+      addLog('warn', 'response_not_json', {
+        requestId: result.requestId,
+        http: response.status,
+        preview: String(text || '').replace(/\s+/g, ' ').slice(0, 300),
+      });
       return response;
     }
+    const summary = responseSummary(data);
     const restored = restoreOpenAI(data, result.toolName, result.paramName)
       || restoreGemini(data, result.toolName, result.paramName);
     if (!restored) {
       setStatus('模型未返回指定工具调用，已原样放行');
+      addLog('warn', 'tool_response_not_restored', {
+        requestId: result.requestId,
+        expectedTool: result.toolName,
+        response: summary,
+      });
       return response;
     }
     setStatus(`已还原工具正文 · ${new Date().toLocaleTimeString()}`);
+    addLog('info', 'tool_response_restored', {
+      requestId: result.requestId,
+      expectedTool: result.toolName,
+      response: summary,
+    });
     return new runtime.target.Response(JSON.stringify(data), {
       status: response.status,
       statusText: response.statusText,
@@ -363,11 +494,25 @@
 
     const result = rewriteRequest(rawBody);
     if (!result) return original.apply(thisArg, args);
+    result.requestId = `tct-${Date.now().toString(36)}-${++runtime.requestSequence}`;
     const patched = buildRequestArgs(input, init, result.body);
     if (!patched) return original.apply(thisArg, args);
 
     setStatus('请求已改写，等待模型返回');
+    addLog('info', 'request_rewritten', {
+      requestId: result.requestId,
+      url,
+      ...sourceSummary(result.body),
+      wrappedInput: result.wrappedInput,
+      forcedTool: settings.forceTool ? OUTPUT_TOOL : 'auto',
+    });
     const response = await original.apply(thisArg, patched);
+    addLog('info', 'response_received', {
+      requestId: result.requestId,
+      http: response?.status || 0,
+      ok: Boolean(response?.ok),
+      contentType: String(response?.headers?.get?.('content-type') || ''),
+    });
     return restoreResponse(response, result);
   }
 
@@ -397,7 +542,7 @@
     }
     const hooked = function (...args) {
       return intercept(current, this || target, args).catch(error => {
-        console.warn(TAG, '拦截失败，已回退原请求', error);
+        addLog('error', 'intercept_failed_fallback', errorDetails(error));
         return current.apply(this || target, args);
       });
     };
@@ -406,7 +551,7 @@
     runtime.target = target;
     runtime.originalFetch = current;
     runtime.installed = true;
-    console.info(TAG, '已加载');
+    addLog('info', 'extension_loaded', { version: '1.1.0' });
   }
 
   function dispose() {
@@ -479,11 +624,48 @@
     const status = document.createElement('div');
     status.className = 'tct-status';
     status.textContent = runtime.lastStatus;
-    details.append(note, status);
+    const actions = document.createElement('div');
+    actions.className = 'tct-actions';
+    const copyButton = document.createElement('button');
+    copyButton.type = 'button';
+    copyButton.textContent = '复制诊断日志';
+    copyButton.addEventListener('click', async () => {
+      const payload = JSON.stringify({ version: '1.1.0', settings, logs: runtime.logs }, null, 2);
+      try {
+        await navigator.clipboard.writeText(payload);
+        status.textContent = '诊断日志已复制';
+      } catch (error) {
+        status.textContent = '复制失败，请从下方日志框手动复制';
+        addLog('error', 'copy_log_failed', errorDetails(error));
+      }
+    });
+    const clearButton = document.createElement('button');
+    clearButton.type = 'button';
+    clearButton.textContent = '清空日志';
+    clearButton.addEventListener('click', () => {
+      runtime.logs.length = 0;
+      saveLogs();
+      renderLogs();
+      status.textContent = '日志已清空';
+    });
+    actions.append(copyButton, clearButton);
+    const logView = document.createElement('pre');
+    logView.className = 'tct-log';
+    details.append(note, status, actions, logView);
     host.append(details);
+    renderLogs();
   }
 
   install();
+  window.__toolCallTransportDebug = {
+    getLogs: () => JSON.parse(JSON.stringify(runtime.logs)),
+    getSettings: () => ({ ...settings }),
+    clearLogs: () => {
+      runtime.logs.length = 0;
+      saveLogs();
+      renderLogs();
+    },
+  };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', mountSettings, { once: true });
   } else {
