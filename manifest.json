@@ -1,0 +1,12 @@
+{
+  "display_name": "Tool Call Transport",
+  "loading_order": 250,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Local extraction from user-provided preset",
+  "version": "1.0.0",
+  "homePage": "",
+  "auto_update": false
+}
