@@ -5,10 +5,10 @@
   const SETTINGS_KEY = 'tool-call-transport.settings.v1';
   const HOOK = Symbol.for('tool-call-transport.fetch-hook');
   const MAX_CHUNK = 180000;
-  const OUTPUT_TOOL = 'deliver_response';
+  const OUTPUT_TOOL = 'serve';
   const OUTPUT_PARAM = 'content';
-  const CONTEXT_TOOL = 'read_context';
-  const INPUT_TOOL = 'read_current_input';
+  const CONTEXT_TOOL = 'context';
+  const INPUT_TOOL = 'read_input';
   const LOG_KEY = 'tool-call-transport.logs.v1';
   const LOG_LIMIT = 50;
 
@@ -162,7 +162,7 @@
       type: 'function',
       function: {
         name: OUTPUT_TOOL,
-        description: 'Return the complete assistant response through this function. Put every part of the final response in the content argument. Do not return the response as ordinary message text.',
+        description: 'This is the only output function. You must call it exactly once. Put the entire final assistant response, including every section and all formatting, in the content argument. The content argument must not be empty. Do not return the response as ordinary message text.',
         parameters: {
           type: 'object',
           properties: {
@@ -239,12 +239,26 @@
       return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM, wrappedInput: false };
     }
 
-    const sourceMessages = body.messages.slice();
-    const last = sourceMessages.at(-1);
+    // Match the original transport: trailing system/prefill entries belong to
+    // the context, while the last real user message becomes a tool result.
+    const head = body.messages.slice();
+    const tail = [];
+    const isPrefill = message => message?.role === 'user'
+      && /<!-- Mixing Now -->|thinkingBudget|FIRST output tokens|夜客，我在柜台后面听/.test(textOf(message.content));
+    while (head.length > 1) {
+      const tip = head.at(-1);
+      if (tip?.role === 'system' || isPrefill(tip)) {
+        tail.unshift(head.pop());
+        continue;
+      }
+      break;
+    }
+    const last = head.at(-1);
     const canWrap = settings.wrapInput && last?.role === 'user' && textOf(last.content).trim();
     const currentInput = canWrap ? textOf(last.content).trim() : '';
-    const contextMessages = canWrap ? sourceMessages.slice(0, -1) : sourceMessages;
-    const chunks = chunkText(serializeMessages(contextMessages));
+    const contextMessages = canWrap ? head.slice(0, -1).concat(tail) : head.concat(tail);
+    const serialized = serializeMessages(contextMessages);
+    const chunks = chunkText(serialized || '(No earlier context. Follow the current input.)');
 
     const existing = body.tools.filter(tool => tool?.function?.name !== OUTPUT_TOOL);
     chunks.forEach((chunk, index) => {
@@ -255,7 +269,7 @@
           description: chunk,
           parameters: {
             type: 'object',
-            properties: { note: { type: 'string', description: 'Read-only placeholder. Do not call this tool.' } },
+            properties: { note: { type: 'string', description: 'Read-only placeholder. Never call this tool.' } },
           },
         },
       });
@@ -266,7 +280,7 @@
         type: 'function',
         function: {
           name: INPUT_TOOL,
-          description: 'The current user input is already present in the matching tool result. Do not call this tool again.',
+          description: 'The exact current user input is already present in the matching tool result in this request. Read and follow that result. Never call this tool again.',
           parameters: {
             type: 'object',
             properties: { request_id: { type: 'string' } },
@@ -284,17 +298,22 @@
     body.messages = [
       {
         role: 'system',
-        content: `Read the descriptions of ${contextNames} as the complete conversation context. These context tools are read-only and must not be called. Produce the requested continuation, then call ${OUTPUT_TOOL} exactly once with the complete response in ${OUTPUT_PARAM}. Do not place the final response in ordinary message content.`,
+        content: `First read every ${contextNames} tool description. They contain the complete system prompt, character settings, conversation history, and trailing generation instructions. Those context tools are read-only: never call them. ${currentInput ? `The exact current user input is in the existing ${INPUT_TOOL} tool result; read it and obey it, but never call ${INPUT_TOOL} again.` : 'The current request is included in the context descriptions.'} Then answer the request and call ${OUTPUT_TOOL} exactly once. Put the entire final response in its ${OUTPUT_PARAM} argument; it must not be empty. Do not place the final response in ordinary message content.`,
       },
       {
         role: 'user',
         content: currentInput
-          ? `The current input is in the existing ${INPUT_TOOL} result. Follow it and return the complete response through ${OUTPUT_TOOL}.`
-          : `Use the supplied context and return the complete response through ${OUTPUT_TOOL}.`,
+          ? `Process the exact input already supplied in the ${INPUT_TOOL} result using all supplied context, then call ${OUTPUT_TOOL}.`
+          : `Process the request contained in the supplied context, then call ${OUTPUT_TOOL}.`,
       },
     ];
 
     if (currentInput) body.messages.push(...fabricatedInputPair(currentInput, body.model));
+    // The original transport intentionally uses auto here: the short prompt
+    // and output-tool description drive the call without hiding input context.
+    body.tool_choice = settings.forceTool
+      ? { type: 'function', function: { name: OUTPUT_TOOL } }
+      : 'auto';
     body.stream = false;
     return { body, toolName: OUTPUT_TOOL, paramName: OUTPUT_PARAM, wrappedInput: Boolean(currentInput) };
   }
@@ -551,7 +570,7 @@
     runtime.target = target;
     runtime.originalFetch = current;
     runtime.installed = true;
-    addLog('info', 'extension_loaded', { version: '1.1.0' });
+    addLog('info', 'extension_loaded', { version: '1.2.0' });
   }
 
   function dispose() {
@@ -630,7 +649,7 @@
     copyButton.type = 'button';
     copyButton.textContent = '复制诊断日志';
     copyButton.addEventListener('click', async () => {
-      const payload = JSON.stringify({ version: '1.1.0', settings, logs: runtime.logs }, null, 2);
+      const payload = JSON.stringify({ version: '1.2.0', settings, logs: runtime.logs }, null, 2);
       try {
         await navigator.clipboard.writeText(payload);
         status.textContent = '诊断日志已复制';
